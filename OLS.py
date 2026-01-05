@@ -3,15 +3,12 @@ import imageio
 import numpy as np
 from stable_baselines3 import PPO
 
-# -----------------------------------------------------------
-# 1. WRAPPER DE 5 OBJETIVOS (CORREGIDO Y RE-ESCALADO)
-# -----------------------------------------------------------
+# Wrapper multi-objetivo para LunarLander con 5 dimensiones de recompensa
 class Lander5ObjWrapper(gym.Wrapper):
     def __init__(self, env, current_weights):
         super().__init__(env)
         self.pasos = 0 
         self.contador_suelo = 0
-        # Pesos iniciales
         self.current_weights = np.array(current_weights, dtype=np.float32)
         
     def update_weights(self, new_weights):
@@ -33,82 +30,65 @@ class Lander5ObjWrapper(gym.Wrapper):
         contacto_ambas = contacto_izq and contacto_der
         esta_estable = contacto_ambas and abs(vel_y) < 0.05
         
-        # Lógica de temporizador (2 segundos / 100 frames)
+        # Objetivo cumplido tras 2 segundos estable (100 frames)
         if esta_estable:
             self.contador_suelo += 1
         else:
             self.contador_suelo = 0 
         objetivo_cumplido = self.contador_suelo >= 100
 
-        # --- VECTOR DE 5 DIMENSIONES ---
-        # [0: Centrado, 1: Tiempo, 2: Descenso, 3: Estabilidad, 4: Aterrizaje]
+        # Vector de recompensas: [Centrado, Tiempo, Descenso, Estabilidad, Aterrizaje]
         r_vec = np.zeros(5)
 
         if not objetivo_cumplido:
             
-            # --- OBJ 0: CENTRADO (Navegación Lateral) ---
-            # Penalización Densa. Escalado: 0.01 por paso.
-            # Si se mantiene descentrado 300 pasos -> -3.0 acumulado (Comparable a aterrizaje)
+            # OBJ 0: Control lateral (Centrado)
             if not contacto_izq and not contacto_der:
                 r_vec[0] = -abs(pos_x) * 0.05 
 
-            # --- OBJ 2: CONTROL DE DESCENSO ---
-            # Castigo por flotar
+            # OBJ 2: Control de descenso
             if abs(pos_x) < 0.2 and vel_y > -0.2:
-                r_vec[2] = -0.05
+                r_vec[2] = -0.05  # Castigo por flotar
                 
-            # Premio denso por bajar suavemente
-            # Escalado: 0.01 por paso. 100 pasos de bajada = +1.0 total.
             if -1.5 < vel_y < -0.5:
-                r_vec[2] += 0.01
+                r_vec[2] += 0.01  # Premio por descenso controlado
 
-            # --- OBJ 1: EFICIENCIA TEMPORAL ---
-            # CORRECCIÓN IMPORTANTE: Penalización constante pequeña.
-            # -0.002 * 500 pasos = -1.0 (Equivalente a perder el bonus de aterrizaje)
+            # OBJ 1: Eficiencia temporal
             if self.contador_suelo == 0:
                 r_vec[1] = -0.002
             
-            # --- OBJ 3: ESTABILIDAD (Paciencia y Disciplina) ---
+            # OBJ 3: Estabilidad
             if esta_estable:
-                r_vec[3] = 0.02 # Premio por esperar
-                
-                # Penalización por "Disciplina" (tocar controles)
-                # CORRECCIÓN: Reducido de -1.0 a -0.05 para no "matar" el aprendizaje
+                r_vec[3] = 0.02
                 if action != 0:
-                     r_vec[3] -= 0.05
+                     r_vec[3] -= 0.05  # Disciplina: no tocar controles cuando está estable
         
         else:
-            # --- OBJ 4: ATERRIZAJE FINAL ---
+            # OBJ 4: Aterrizaje exitoso
             terminated = True
-            # Recompensas Esparsas (Solo ocurren una vez, magnitud grande OK)
             if abs(pos_x) < 0.1:
-                r_vec[4] = 1.0   # Éxito Total
+                r_vec[4] = 1.0   # Aterrizaje centrado
             elif abs(pos_x) < 0.2:
-                r_vec[4] = 0.5   # Éxito Parcial
+                r_vec[4] = 0.5   # Aterrizaje aceptable
             else:
-                r_vec[4] = -0.5  # Aterrizaje Sucio
+                r_vec[4] = -0.5  # Aterrizaje descentrado
 
-        # Penalización global por Crash
+        # Penalización por crash antes de cumplir objetivo
         if terminated and not objetivo_cumplido:
-            # Si se estrella, penalizamos el objetivo final fuertemente
             if not esta_estable:
                 r_vec[4] -= 1.0
 
-        # Escalarización (Producto Punto: w * r)
+        # Escalarización mediante producto punto
         scalar_reward = np.dot(r_vec, self.current_weights)
-        
-        # Guardamos el vector puro
         info["vector_reward"] = r_vec
         
         return obs, scalar_reward, terminated, truncated, info
 
-# -----------------------------------------------------------
-# 2. SOLUCIONADOR OLS (MEJORADO CON PUNTO UTÓPICO)
-# -----------------------------------------------------------
-class HighDimOLSSolver:
+# Optimistic Linear Support: algoritmo para encontrar frontera de Pareto
+class OLS:
     def __init__(self, num_objectives=5):
         self.num_obj = num_objectives
-        self.ccs = [] # Convex Coverage Set (Soluciones encontradas)
+        self.ccs = []  # Convex Coverage Set
         self.visited_weights = []
 
     def add_solution(self, weights, value_vector, model_path):
@@ -121,44 +101,43 @@ class HighDimOLSSolver:
         print(f"[OLS] Solución agregada para w={np.round(weights, 2)}. Valor={np.round(value_vector, 2)}")
 
     def get_next_weight(self):
-        # FASE 1: Explorar esquinas (Objetivos puros)
+        # FASE 1: Explorar objetivos puros (esquinas del simplex)
         if len(self.ccs) < self.num_obj:
             next_w = np.zeros(self.num_obj)
             next_w[len(self.ccs)] = 1.0
             return next_w
 
-        # FASE 2: Búsqueda OLS (Optimistic Linear Support)
+        # FASE 2: Búsqueda OLS mediante maximin improvement
         print("[OLS] Calculando siguiente peso óptimo (Maximin Improvement)...")
         
         best_w = None
         max_improvement = -np.inf
         
-        # Punto Utópico Virtual: Asumimos que es posible obtener 1.0 en todo acumulado
-        # (Ajustable según el entorno, pero 1.0 es una buena base normalizada)
+        # Punto utópico: valor teórico máximo alcanzable en cada objetivo
         utopian_point = np.ones(self.num_obj) * 1.5 
         
-        # Muestreo Monte Carlo
+        # Muestreo Monte Carlo en el espacio de pesos
         for _ in range(5000): 
             w = np.random.rand(self.num_obj)
-            w /= np.sum(w) # Normalizar suma a 1
+            w /= np.sum(w)
             
-            # 1. ¿Qué valor obtenemos AHORA con la mejor política existente para este w?
+            # Mejor valor actual con políticas existentes
             current_max_val = -np.inf
             for sol in self.ccs:
                 val = np.dot(sol["value"], w)
                 if val > current_max_val:
                     current_max_val = val
             
-            # 2. ¿Qué valor obtendríamos en el MEJOR caso teórico (Utópico)?
+            # Valor optimista alcanzable
             optimistic_val = np.dot(utopian_point, w)
             
-            # 3. La diferencia es la "posible mejora" (Regret)
+            # Potencial de mejora (regret)
             improvement_potential = optimistic_val - current_max_val
             
-            # 4. Filtro de diversidad: No repetir pesos cercanos
+            # Filtro de diversidad: evitar pesos ya explorados
             dist_min = min([np.linalg.norm(w - vw) for vw in self.visited_weights])
             
-            if dist_min > 0.15: # Distancia mínima de seguridad en el espacio de pesos
+            if dist_min > 0.15:
                 if improvement_potential > max_improvement:
                     max_improvement = improvement_potential
                     best_w = w
@@ -181,19 +160,12 @@ def evaluate_5d_agent(env, model, num_episodes=5):
         total_vec += ep_vec
     return total_vec / num_episodes
 
-# -----------------------------------------------------------
-# 3. EJECUCIÓN DEL BUCLE OLS
-# -----------------------------------------------------------
 def run_ols_final():
-    # Crear entorno base
     env = gym.make("LunarLander-v3")
-    # Inicializamos wrapper con pesos dummy
     env = Lander5ObjWrapper(env, np.ones(5)/5.0)
     
-    ols = HighDimOLSSolver(num_objectives=5)
-    
-    # 5 Esquinas + 4 Refinamientos
-    total_iterations = 9 
+    ols = OLS(num_objectives=5)
+    total_iterations = 9  # 5 esquinas + 4 refinamientos
     
     for iteration in range(total_iterations):
         
@@ -207,23 +179,20 @@ def run_ols_final():
         print(f"Pesos Objetivo: {np.round(target_weights, 3)}")
         print(f"Leyenda: [Centrado, Tiempo, Descenso, Estabilidad, Final]")
 
-        # Actualizar pesos en el entorno
         env.update_weights(target_weights)
         
-        # Entrenar
-        # TIMESTEPS: Aumentado a 100k para dar tiempo a converger con las nuevas escalas
+        # Entrenamiento con PPO
         model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0003, ent_coef=0.01)
         model.learn(total_timesteps=100000)
         
-        # Evaluar el vector de desempeño real (sin escalarización)
+        # Evaluación del vector de desempeño sin escalarización
         val_vector = evaluate_5d_agent(env, model)
         
-        # Guardar solución en OLS
         filename = f"ols_fixed_iter_{iteration}"
         model.save(filename)
         ols.add_solution(target_weights, val_vector, filename)
 
-        # Generar video de control
+        # Generación de video
         print(f"Grabando video para iteración {iteration}...")
         try:
             video_env = gym.make("LunarLander-v3", render_mode="rgb_array")

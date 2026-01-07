@@ -8,6 +8,7 @@ class LanderChebyshevWrapper(gym.Wrapper):
         super().__init__(env)
         self.pasos = 0
         self.contador_suelo = 0
+        # Definimos los pesos
         self.w_distancia = 3.0  
         self.w_velocidad = 5.0  
         self.w_angulo    = 2.0 
@@ -31,6 +32,7 @@ class LanderChebyshevWrapper(gym.Wrapper):
         contacto_der = obs[7]
 
         contacto_ambas = contacto_izq and contacto_der
+        # Solo contamos el aterrizaje si toca con ambas patas y está casi quieto
         esta_estable = contacto_ambas and abs(vel_y) < 0.05
 
         if esta_estable:
@@ -40,7 +42,6 @@ class LanderChebyshevWrapper(gym.Wrapper):
 
         objetivo_cumplido = self.contador_suelo >= 100
 
-
         error_distancia = abs(pos_x)  
         error_angulo    = abs(angulo) 
         error_velocidad = np.sqrt(vel_x**2 + vel_y**2)
@@ -49,21 +50,21 @@ class LanderChebyshevWrapper(gym.Wrapper):
         p_vel  = error_velocidad * self.w_velocidad
         p_ang  = error_angulo    * self.w_angulo
 
-
+        # Penalizamos basándonos en el PEOR error actual.
+        # Obliga al agente a arreglar su mayor defecto en cada paso.
         worst_error = max(p_dist, p_vel, p_ang)
         step_reward = -worst_error + 0.1
-
-
 
         if not objetivo_cumplido:
             reward = step_reward
 
             if terminated:
-                reward = -10.0 
+                reward = -10.0 # Castigo fuerte si se estrella
 
         else:
             terminated = True 
 
+            # Premios finales según precisión: cuanto más centrado, más puntos.
             if abs(pos_x) < 0.1:
                 reward = 100.0 
             elif abs(pos_x) < 0.2:
@@ -80,7 +81,6 @@ def train_final_lander():
     print("--- INICIANDO ENTRENAMIENTO (Chebyshev Scalarization) ---")
 
     model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0007)
-
     model.learn(total_timesteps=300000)
 
     print("--- Entrenamiento finalizado ---")
@@ -98,6 +98,7 @@ def save_video(model, filename="lunar_lander_chebyshev.mp4"):
     truncated = False
     while not (done or truncated):
         frames.append(env.render())
+        # Usamos deterministic=True para ver lo mejor que aprendió 
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, done, truncated, _ = env.step(action)
 
